@@ -5,7 +5,7 @@ import itertools
 import os
 
 from typing import List, Optional
-
+import math
 import numpy as np
 
 try:
@@ -14,6 +14,8 @@ try:
     import transformers
 except ImportError:
     pass
+
+import sentencepiece
 
 from ctranslate2.converters import utils
 from ctranslate2.converters.converter import Converter
@@ -2830,6 +2832,273 @@ class CamembertLoader(ModelLoader):
         if offset > 0:
             spec.encodings = spec.encodings[offset + 1 :]
 
+@register_loader("RotaryIndicTransConfig")
+class RotaryIndicTransLoader(ModelLoader):
+    # ... ( __init__, architecture_name, _get_vocab_list_from_spm_processor remain the same) ...
+    def __init__(self):
+        super().__init__()
+        self.model = None
+        self.converter_parent = None # Should be set by the main TransformersConverter
+
+    @property
+    def architecture_name(self):
+        # This should be the actual model class name from the HF repository.
+        return "AutoModelForSeq2SeqLM" # This is for the *model*, tokenizer is separate
+
+    def _get_vocab_list_from_spm_processor(self, spm_processor: sentencepiece.SentencePieceProcessor):
+        tokens = []
+        for i in range(spm_processor.get_piece_size()): # get_piece_size() includes special tokens in SPM
+            tokens.append(spm_processor.id_to_piece(i))
+        return tokens
+
+    def __call__(self, model, hf_tokenizer_main_obj): # hf_tokenizer_main_obj is IndicTransTokenizer from tokenization_indictrans.py
+        self.model = model
+
+        print(f"[RotaryIndicTransLoader Debug] Received tokenizer of type: {type(hf_tokenizer_main_obj)}")
+        
+        # Now we expect src_spm and tgt_spm directly on hf_tokenizer_main_obj
+        if not (hasattr(hf_tokenizer_main_obj, 'src_spm') and \
+                hasattr(hf_tokenizer_main_obj, 'tgt_spm')):
+            raise ValueError(
+                "The loaded tokenizer (expected to be IndicTransTokenizer from tokenization_indictrans.py) "
+                "does not have 'src_spm' and 'tgt_spm' attributes. \n"
+                "This indicates a mismatch with the expected tokenizer structure from "
+                f"'{model.name_or_path if hasattr(model, 'name_or_path') else 'UNKNOWN_MODEL_PATH'}'.\n"
+                "Double-check the 'tokenization_indictrans.py' file in the model repository."
+            )
+
+        source_spm_processor = hf_tokenizer_main_obj.src_spm
+        target_spm_processor = hf_tokenizer_main_obj.tgt_spm
+
+        if not isinstance(source_spm_processor, sentencepiece.SentencePieceProcessor) or \
+           not isinstance(target_spm_processor, sentencepiece.SentencePieceProcessor):
+            raise TypeError(
+                "Attributes 'src_spm' or 'tgt_spm' on the loaded tokenizer are not "
+                "SentencePieceProcessor instances."
+            )
+            
+        # Get vocabulary lists directly from the SPM processors
+        source_tokens = self._get_vocab_list_from_spm_processor(source_spm_processor)
+        target_tokens = self._get_vocab_list_from_spm_processor(target_spm_processor)
+
+        print(f"[RotaryIndicTransLoader Debug] Source SPM pieces: {len(source_tokens)}")
+        print(f"[RotaryIndicTransLoader Debug] Target SPM pieces: {len(target_tokens)}")
+        print(f"[RotaryIndicTransLoader Debug] Expected encoder_vocab_size from model config: {model.config.encoder_vocab_size}")
+        print(f"[RotaryIndicTransLoader Debug] Expected decoder_vocab_size from model config: {model.config.decoder_vocab_size}")
+        
+        final_source_tokens = source_tokens
+        if model.config.encoder_vocab_size > len(source_tokens):
+            print(f"[RotaryIndicTransLoader Info] Padding source vocab from {len(source_tokens)} to {model.config.encoder_vocab_size}")
+            final_source_tokens.extend([f"<added_token_src_{i}>" for i in range(len(source_tokens), model.config.encoder_vocab_size)])
+        elif model.config.encoder_vocab_size < len(source_tokens):
+            print(f"[RotaryIndicTransLoader Warning] Truncating source vocab from {len(source_tokens)} to {model.config.encoder_vocab_size}")
+            final_source_tokens = source_tokens[:model.config.encoder_vocab_size]
+
+        final_target_tokens = target_tokens
+        if model.config.decoder_vocab_size > len(target_tokens):
+            print(f"[RotaryIndicTransLoader Info] Padding target vocab from {len(target_tokens)} to {model.config.decoder_vocab_size}")
+            final_target_tokens.extend([f"<added_token_tgt_{i}>" for i in range(len(target_tokens), model.config.decoder_vocab_size)])
+        elif model.config.decoder_vocab_size < len(target_tokens):
+            print(f"[RotaryIndicTransLoader Warning] Truncating target vocab from {len(target_tokens)} to {model.config.decoder_vocab_size}")
+            final_target_tokens = target_tokens[:model.config.decoder_vocab_size]
+
+
+        spec = self.get_model_spec(model)
+        self.set_config(spec.config, model, target_spm_processor, source_spm_processor, hf_tokenizer_main_obj)
+        self.set_vocabulary(spec, final_source_tokens, final_target_tokens)
+        
+        return spec
+
+    # get_model_spec remains the same.
+
+    def set_vocabulary(self, spec, source_tokens, target_tokens):
+            if self.model is None:
+                raise ValueError("Model object not set in RotaryIndicTransLoader.")
+
+            expected_src_vocab_size = self.model.config.encoder_vocab_size
+            expected_tgt_vocab_size = self.model.config.decoder_vocab_size
+
+            if len(source_tokens) != expected_src_vocab_size:
+                raise ValueError(
+                    f"[RotaryIndicTransLoader Error] Prepared source_tokens list has length {len(source_tokens)}, "
+                    f"but the model config (encoder_vocab_size) expects {expected_src_vocab_size}."
+                )
+            if len(target_tokens) != expected_tgt_vocab_size:
+                raise ValueError(
+                    f"[RotaryIndicTransLoader Error] Prepared target_tokens list has length {len(target_tokens)}, "
+                    f"but the model config (decoder_vocab_size) expects {expected_tgt_vocab_size}."
+                )
+
+            spec.register_source_vocabulary(source_tokens)
+            spec.register_target_vocabulary(target_tokens)
+            
+            # Filenames as they will be in the CTranslate2 model directory (after being copied by --copy_files)
+            source_spm_filename = "model.SRC"
+            target_spm_filename = "model.TGT"
+
+            # Check if the files *could have been copied* (optional, relies on converter_parent)
+            files_verified_for_copying = True # Assume true if not checking
+            if self.converter_parent and hasattr(self.converter_parent, 'get_model_file'):
+                try:
+                    self.converter_parent.get_model_file(source_spm_filename) 
+                    self.converter_parent.get_model_file(target_spm_filename)
+                    print(f"[RotaryIndicTransLoader Info] Verified '{source_spm_filename}' and '{target_spm_filename}' are available from source model.")
+                except ValueError as e:
+                    files_verified_for_copying = False
+                    print(f"[RotaryIndicTransLoader Warning] Could not find/verify one or both SPM model files "
+                        f"('{source_spm_filename}', '{target_spm_filename}') "
+                        f"via converter_parent.get_model_file: {e}. "
+                        "Ensure these files were specified in the --copy_files argument.")
+            else:
+                print("[RotaryIndicTransLoader Info] `converter_parent` not set or lacks `get_model_file`. "
+                    "Skipping source file verification for SPM models. "
+                    "Relying on --copy_files to place them in the CTranslate2 model directory.")
+
+
+            if not hasattr(spec, 'config') or spec.config is None:
+                # This should not happen if spec is initialized correctly, e.g. TransformerSpec has a get_default_config
+                print("[RotaryIndicTransLoader Error] spec.config is not initialized!")
+                # spec.config = model_spec.ModelConfig() # Or the appropriate config type
+            
+
+            if hasattr(spec.config, "source_spm_model_path"): # Check if attribute exists
+                spec.config.source_spm_model_path = source_spm_filename
+                print(f"[RotaryIndicTransLoader Info] Set spec.config.source_spm_model_path = '{source_spm_filename}'")
+            else: # If the attribute doesn't pre-exist from a default config, add it.
+                spec.config.add_attribute("source_spm_model_path", source_spm_filename)
+                print(f"[RotaryIndicTransLoader Info] Added and set spec.config.source_spm_model_path = '{source_spm_filename}'")
+
+            if hasattr(spec.config, "target_spm_model_path"):
+                spec.config.target_spm_model_path = target_spm_filename
+                print(f"[RotaryIndicTransLoader Info] Set spec.config.target_spm_model_path = '{target_spm_filename}'")
+            else:
+                spec.config.add_attribute("target_spm_model_path", target_spm_filename)
+                print(f"[RotaryIndicTransLoader Info] Added and set spec.config.target_spm_model_path = '{target_spm_filename}'")
+
+
+
+    def set_config(self, ct2_config, hf_model, hf_target_spm_processor, hf_source_spm_processor, hf_main_tokenizer_obj):
+
+        ct2_config.bos_token = hf_main_tokenizer_obj.bos_token if hf_main_tokenizer_obj.bos_token is not None else hf_source_spm_processor.id_to_piece(hf_source_spm_processor.bos_id()) if hf_source_spm_processor.bos_id() !=-1 else "<s>"
+        
+
+        ct2_config.eos_token = hf_main_tokenizer_obj.eos_token if hf_main_tokenizer_obj.eos_token is not None else hf_target_spm_processor.id_to_piece(hf_target_spm_processor.eos_id()) if hf_target_spm_processor.eos_id() !=-1 else "</s>"
+
+
+        ct2_config.unk_token = hf_main_tokenizer_obj.unk_token if hf_main_tokenizer_obj.unk_token is not None else hf_target_spm_processor.id_to_piece(hf_target_spm_processor.unk_id()) if hf_target_spm_processor.unk_id() !=-1 else "<unk>"
+
+        # Decoder start token ID is crucial for multilingual models
+        # It's a language ID (e.g. <en>, <hi>) that must be in the target SPM.
+        decoder_start_token_id = hf_model.config.decoder_start_token_id
+        if decoder_start_token_id is not None:
+
+            ct2_config.decoder_start_token = hf_target_spm_processor.id_to_piece(decoder_start_token_id)
+        else:
+
+            raise ValueError("decoder_start_token_id is not defined in Hugging Face model config.")
+
+        ln_eps = getattr(hf_model.config, "layer_norm_eps", getattr(hf_model.config, "rms_norm_eps", None))
+        if ln_eps is not None:
+            ct2_config.layer_norm_epsilon = ln_eps
+            
+
+    def get_model_spec(self, model):
+        activation_fn_name = model.config.activation_function
+        activation = _SUPPORTED_ACTIVATIONS.get(activation_fn_name)
+        if activation is None:
+            raise ValueError(f"Unsupported activation: {activation_fn_name}")
+
+        rope_config = model.config.rope_args
+        rotary_base = float(rope_config.get("theta", 10000.0))
+        hf_scaling_factor = float(rope_config.get("scaling_factor", 1.0))
+
+        ct2_rotary_scaling_type = None
+        ct2_rotary_scaling_factor = 1.0
+        if hf_scaling_factor != 1.0:
+            ct2_rotary_scaling_type = attention_spec.RotaryScalingType.Linear
+            ct2_rotary_scaling_factor = hf_scaling_factor
+        
+        if model.config.encoder_attention_heads <= 0:
+             raise ValueError("encoder_attention_heads must be > 0")
+        encoder_head_dim = model.config.encoder_embed_dim // model.config.encoder_attention_heads
+        actual_rotary_dim_for_mha = encoder_head_dim // 2
+
+        spec = transformer_spec.TransformerSpec.from_config(
+            num_layers=(model.config.encoder_layers, model.config.decoder_layers),
+            num_heads=model.config.encoder_attention_heads,
+            pre_norm=model.config.encoder_normalize_before,
+            activation=activation,
+            layernorm_embedding=model.config.layernorm_embedding,
+            rotary_dim=actual_rotary_dim_for_mha,
+            rotary_interleave=True,
+            rotary_scaling_type=ct2_rotary_scaling_type,
+            rotary_scaling_factor=ct2_rotary_scaling_factor,
+            rotary_base=rotary_base,
+        )
+
+        self.set_encoder(spec.encoder, model.model.encoder)
+        self.set_decoder(spec.decoder, model.model.decoder)
+        self.set_linear(spec.decoder.projection, model.lm_head)
+
+        if model.config.share_decoder_input_output_embed:
+            if spec.decoder.projection.weight is not spec.decoder.embeddings.weight:
+                 spec.decoder.projection.weight = spec.decoder.embeddings.weight
+        return spec
+
+    def set_common_layers(self, ct2_spec_stack, hf_module_stack):
+        is_encoder = isinstance(ct2_spec_stack, transformer_spec.TransformerEncoderSpec)
+        embed_dim_config = hf_module_stack.config.encoder_embed_dim if is_encoder else hf_module_stack.config.decoder_embed_dim
+        scale_embedding_config = self.model.config.scale_embedding
+        embed_scale = (math.sqrt(embed_dim_config) if scale_embedding_config else 1.0)
+        ct2_spec_stack.scale_embeddings = embed_scale
+        self.set_embeddings(
+            ct2_spec_stack.embeddings[0] if isinstance(ct2_spec_stack.embeddings, list) else ct2_spec_stack.embeddings,
+            hf_module_stack.embed_tokens,
+        )
+        if hasattr(hf_module_stack, "layer_norm") and hasattr(ct2_spec_stack, "layer_norm") and ct2_spec_stack.layer_norm is not None:
+            self.set_layer_norm(ct2_spec_stack.layer_norm, hf_module_stack.layer_norm)
+        if hasattr(hf_module_stack, "layernorm_embedding") and hasattr(ct2_spec_stack, "layernorm_embedding") and ct2_spec_stack.layernorm_embedding is not None:
+            self.set_layer_norm(ct2_spec_stack.layernorm_embedding, hf_module_stack.layernorm_embedding)
+
+    def set_encoder(self, ct2_encoder_spec, hf_encoder):
+        self.set_common_layers(ct2_encoder_spec, hf_encoder)
+        for ct2_layer_spec, hf_layer in zip(ct2_encoder_spec.layer, hf_encoder.layers):
+            self.set_attention(ct2_layer_spec.self_attention, hf_layer.self_attn, self_attention=True)
+            self.set_layer_norm(ct2_layer_spec.self_attention.layer_norm, hf_layer.self_attn_layer_norm)
+            self.set_linear(ct2_layer_spec.ffn.linear_0, hf_layer.fc1)
+            self.set_linear(ct2_layer_spec.ffn.linear_1, hf_layer.fc2)
+            self.set_layer_norm(ct2_layer_spec.ffn.layer_norm, hf_layer.final_layer_norm)
+
+    def set_decoder(self, ct2_decoder_spec, hf_decoder):
+        self.set_common_layers(ct2_decoder_spec, hf_decoder)
+        for ct2_layer_spec, hf_layer in zip(ct2_decoder_spec.layer, hf_decoder.layers):
+            self.set_attention(ct2_layer_spec.self_attention, hf_layer.self_attn, self_attention=True)
+            self.set_layer_norm(ct2_layer_spec.self_attention.layer_norm, hf_layer.self_attn_layer_norm)
+            if hasattr(hf_layer, "encoder_attn") and hasattr(ct2_layer_spec, "attention"):
+                self.set_attention(ct2_layer_spec.attention, hf_layer.encoder_attn, self_attention=False)
+                self.set_layer_norm(ct2_layer_spec.attention.layer_norm, hf_layer.encoder_attn_layer_norm)
+            self.set_linear(ct2_layer_spec.ffn.linear_0, hf_layer.fc1)
+            self.set_linear(ct2_layer_spec.ffn.linear_1, hf_layer.fc2)
+            self.set_layer_norm(ct2_layer_spec.ffn.layer_norm, hf_layer.final_layer_norm)
+
+    def set_attention(self, ct2_mha_spec, hf_attention_module, self_attention=False):
+        q_proj_hf, k_proj_hf, v_proj_hf, out_proj_hf = (
+            hf_attention_module.q_proj, hf_attention_module.k_proj,
+            hf_attention_module.v_proj, hf_attention_module.out_proj
+        )
+        if self_attention:
+            fused_qkv_spec, out_spec = ct2_mha_spec.linear[0], ct2_mha_spec.linear[1]
+            q_spec_tmp, k_spec_tmp, v_spec_tmp = common_spec.LinearSpec(), common_spec.LinearSpec(), common_spec.LinearSpec()
+            self.set_linear(q_spec_tmp, q_proj_hf); self.set_linear(k_spec_tmp, k_proj_hf); self.set_linear(v_spec_tmp, v_proj_hf)
+            utils.fuse_linear(fused_qkv_spec, [q_spec_tmp, k_spec_tmp, v_spec_tmp])
+            self.set_linear(out_spec, out_proj_hf)
+        else: 
+            q_spec_ct2, kv_fused_spec_ct2, out_spec_ct2 = ct2_mha_spec.linear[0], ct2_mha_spec.linear[1], ct2_mha_spec.linear[2]
+            self.set_linear(q_spec_ct2, q_proj_hf)
+            k_spec_tmp, v_spec_tmp = common_spec.LinearSpec(), common_spec.LinearSpec()
+            self.set_linear(k_spec_tmp, k_proj_hf); self.set_linear(v_spec_tmp, v_proj_hf)
+            utils.fuse_linear(kv_fused_spec_ct2, [k_spec_tmp, v_spec_tmp])
+            self.set_linear(out_spec_ct2, out_proj_hf)
 
 def main():
     parser = argparse.ArgumentParser(
